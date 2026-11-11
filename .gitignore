@@ -29,5 +29,25 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+.DS_Store
+
+# PocketHost runtime state (native processes, no containers)
+.pockethost/
+data/
+bin/
+dist/
+pocketghost-local/
+*.db
+*.db-shm
+*.db-wal
+*.log
+
+# The embedded dashboard build must be committed so `make build` works from a
+# clean clone (it contains at least the placeholder index.html/404.html).
+!internal/dashboard/dist/
+!internal/dashboard/dist/**
+
+# Node leftovers from the TypeScript monorepo (removed by the migration)
+node_modules/
