@@ -33,6 +33,20 @@ func newServeCmd() *cobra.Command {
 				defer a.Scheduler.Stop()
 			}
 
+			// The mothership (the original control plane) listens on its own
+			// loopback port, exactly like the original deployment.
+			msAddr := fmt.Sprintf("127.0.0.1:%d", a.Config.MothershipPort)
+			msLn, err := net.Listen("tcp", msAddr)
+			if err != nil {
+				return fmt.Errorf("listen %s: %w", msAddr, err)
+			}
+			go func() {
+				if err := a.Mothership.ServeOn(ctx, msLn); err != nil {
+					a.Logger.Errorf("mothership: %v", err)
+				}
+			}()
+			a.Logger.Infof("mothership listening on %s", msAddr)
+
 			addr := fmt.Sprintf(":%d", a.Config.DaemonPort)
 			srv := &http.Server{
 				Addr:              addr,
@@ -56,6 +70,7 @@ func newServeCmd() *cobra.Command {
 				shutdownCtx, cancelShutdown := context.WithTimeout(context.Background(), 20*time.Second)
 				defer cancelShutdown()
 				_ = srv.Shutdown(shutdownCtx)
+				_ = msLn.Close()
 				return nil
 			case err := <-errCh:
 				if errors.Is(err, http.ErrServerClosed) {

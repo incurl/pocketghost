@@ -9,6 +9,7 @@ import (
 	"github.com/incurl/pocketghost/internal/backup"
 	"github.com/incurl/pocketghost/internal/config"
 	"github.com/incurl/pocketghost/internal/logging"
+	"github.com/incurl/pocketghost/internal/mothership"
 	"github.com/incurl/pocketghost/internal/store"
 )
 
@@ -23,12 +24,25 @@ func testDeps(t *testing.T) (*config.Config, *store.Repo) {
 	if err != nil {
 		t.Fatalf("config: %v", err)
 	}
-	db, err := store.Open(filepath.Join(home, "meta.db"))
-	if err != nil {
-		t.Fatalf("store: %v", err)
+
+	msRoot := filepath.Join(home, "mothership")
+	if _, err := mothership.Materialize(msRoot); err != nil {
+		t.Fatalf("materialize: %v", err)
 	}
-	t.Cleanup(func() { _ = db.Close() })
-	return cfg, store.NewRepo(db)
+	ms := mothership.New(mothership.Config{
+		DataDir: filepath.Join(msRoot, "pb_data"),
+		Root:    msRoot,
+		Addr:    "127.0.0.1:0",
+		IsDev:   true,
+		Logger:  logging.Discard(),
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	if err := ms.Bootstrap(ctx); err != nil {
+		t.Fatalf("bootstrap: %v", err)
+	}
+
+	return cfg, store.NewRepo(mothership.NewStore(ms.Core()))
 }
 
 func TestStartStop(t *testing.T) {

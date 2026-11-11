@@ -3,23 +3,63 @@
 This document explains how the Go implementation replaces the container-based
 orchestrator, and which invariants each layer must preserve.
 
-## 1. Control plane vs data plane
+## 1. The control plane is the original mothership
 
-| Layer | Legacy (TypeScript) | This implementation |
-| --- | --- | --- |
-| Control plane | Express 5 + mothership PocketBase hooks | `internal/api` (Go `net/http`) + `internal/store` |
-| Tenant runtime | one container per instance (`dockerode`) | native OS process per instance (`internal/procs`) |
-| Port mapping | ephemeral `8090/tcp → host:0` | deterministic loopback pool (`PH_INSTANCE_PORT_MIN..MAX`) |
-| Health checks | container inspect + HTTP probe | `GET /api/health` probe + `kill(pid, 0)` |
-| Restart policy | external/daemon logic | bounded backoff restarts inside the supervisor |
-| Reverse proxy | `httpxy` / `http-proxy-middleware` | `net/http/httputil.ReverseProxy` |
-| Rate limiting | `rate-limiter-flexible` + `bottleneck` | `internal/ratelimit` fixed windows + counters |
-| Metadata DB | `better-sqlite3` | `modernc.org/sqlite` (pure Go, CGO-free) |
-| Cron | `cron` NPM package / pm2 | `robfig/cron/v3` in-process |
-| TLS | `devcert` + certbot files | `crypto/x509` self-signed + `autocert` (ACME) |
-| Log tailing | `tail` NPM package | NDJSON writer + subscriber fan-out |
-| FTP/SFTP | `ftp-srv` + `ssh2` | `internal/ftp`, `internal/sftp` (`x/crypto/ssh`) |
-| Files | bind mounts + `InstanceVfs` | `internal/vfs` jailed filesystem |
+The most important decision in this migration: **the control plane is not
+reimplemented**. The upstream PocketHost mothership application
+(`packages/server/src/mothership-app`) is a PocketBase app whose logic lives in
+JavaScript hooks. Those hooks are embedded **verbatim** into this binary and
+executed by the pure-Go PocketBase SDK:
+
+```
+pocketghost (single static binary)
+|
+├── mothership app  <- github.com/pocketbase/pocketbase (pure Go)
+|   ├── pb_hooks/mothership.pb.js   <- ORIGINAL, byte-for-byte
+|   ├── pb_hooks/mothership.js      <- ORIGINAL, byte-for-byte
+|   ├── pb_migrations/*.js          <- ORIGINAL, all 21 files
+|   └── pb_admin_ext/live/          <- ORIGINAL admin extension
+|        -> 32 routes, realtime, collection rules, billing hooks,
+|           Cloudflare sweeps, notifications, admin UI
+|
+└── edge daemon  <- this codebase
+    ├── native process supervisor (internal/procs)
+    ├── reverse proxy + rate limiter (internal/proxy, internal/ratelimit)
+    ├── file services (internal/ftp, internal/sftp)
+    └── scheduler (internal/scheduler)
+```
+
+Why this works without Node.js:
+
+* The hooks contain **no** `require('fs'|'crypto'|'path'|'os')` calls — only
+  `require(`${__hooks}/mothership`)`, which PocketBase's JSVM resolves.
+* They use only PocketBase's own `$app` / `$os` / `$apis` globals, which the
+  JSVM provides.
+* `plugins/jsvm` runs them in goja, a pure-Go JavaScript runtime.
+* The SDK already depends on `modernc.org/sqlite`, so the whole stack stays
+  **CGO-free**.
+
+Two tests guard this invariant (`internal/mothership/mothership_test.go`):
+
+* `TestHooksAreNodeFree` / `TestMigrationsAreNodeFree` fail if a Node built-in
+  ever appears in the embedded assets.
+* `TestMothershipBootsWithOriginalHooks` boots the app, asserts all 21 JS
+  migrations applied, the collections exist with their original fields, and
+  that the original routes answer over HTTP.
+
+### Boot ordering
+
+PocketBase fires `OnBootstrap` handlers in *reverse* registration order, so the
+JS `onBootstrap` handler would run **before** the core bootstrap that applies
+the migrations creating the `instances` table — which the original hook
+queries with raw SQL (`refreshPublicStats`).
+
+To keep the hooks unmodified, the boot sequence is:
+
+1. `applyMigrations()` — a throwaway app with an **empty hooks directory**
+   applies the system + JS migrations.
+2. `core.Bootstrap()` — the real app (with hooks) boots; the collections now
+   exist, so the original hook's `onBootstrap` handler succeeds.
 
 ## 2. Tenant process isolation
 
@@ -84,16 +124,16 @@ Isolation properties and how each is achieved without a container runtime:
 
 ## 4. Metadata database
 
-SQLite tables mirror the PocketBase collections the platform used, with
-PocketBase-compatible record ids (`[a-z0-9]{15}`) and timestamps
-(`YYYY-MM-DD HH:MM:SS.mmmZ`):
+The database is PocketBase's own (`<PH_HOME>/mothership/pb_data/data.db`), so the
+collections are exactly the ones the original mothership defined — `users`,
+`instances`, `edges`, `regions`, `ssh_keys`, `api_tokens`, `campaigns`, ... —
+with PocketBase-compatible record ids (`[a-z0-9]{15}`) and timestamps
+(`YYYY-MM-DD HH:MM:SS.mmmZ`).
 
-`users`, `instances`, `processes`, `edges`, `versions`, `ssh_keys`,
-`api_tokens`, `deploys`, `notifications`, `audit_logs`, `kv`,
-`schema_migrations`.
-
-`processes` replaces Docker's container list. `kv` stores the generated JWT
-signing key when `PH_SECRET` is not configured.
+The only addition is the `processes` collection, created by a Go migration
+(`internal/mothership/migrations.go`). It replaces Docker's container list: it is
+the durable record of which PocketBase OS processes should exist and how to
+re-attach to them after a supervisor restart.
 
 ### Legacy import
 
@@ -101,16 +141,20 @@ signing key when `PH_SECRET` is not configured.
 pocketghost migrate --from /var/lib/pockethost/data/mothership/pb_data/data.db
 ```
 
-The importer copies the intersection of source and destination columns for
-`users`, `instances`, `edges`, `ssh_keys`, `api_tokens` and `versions`, mapping
-the PocketBase 0.22 `passwordHash` column onto `password`. It runs in a single
-transaction and is idempotent (`insert or replace`), so it can be re-run.
+The legacy build already produced a PocketBase database, so the schema matches
+exactly: the importer copies the rows of `users`, `instances`, `edges`,
+`ssh_keys` and `api_tokens` through PocketBase's record API, preserving the
+original record ids so existing links stay valid. It is idempotent (a record
+that already exists is skipped).
 
 ## 5. Filesystem layout
 
 ```
 $PH_HOME/
-├── pocketghost.db            metadata database
+├── mothership/               the control plane (original app)
+|   ├── pb_hooks/             original JS hooks
+|   ├── pb_migrations/        original migrations
+|   └── pb_data/data.db       control-plane database
 ├── pocketbase/<ver>/<os_arch>/pocketbase
 ├── ssl/tls.{cert,key}        dev certificate (or ACME cache in ssl/acme)
 └── ssh/host_key              SFTP host key

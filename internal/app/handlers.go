@@ -15,17 +15,43 @@ import (
 	"github.com/incurl/pocketghost/internal/proxy"
 )
 
-// DaemonHandler is the data plane listener: PocketBase instance hosts are
-// reverse-proxied to their native processes, everything else is served by the
-// control-plane API.
+// DaemonHandler is the data-plane listener: PocketBase instance hosts are
+// reverse-proxied to their native processes, control-plane hosts are forwarded
+// to the local mothership, and everything else is served by the dashboard.
 func (a *App) DaemonHandler() http.Handler {
 	apiHandler := a.API.Handler()
+	mothershipHost := a.Config.MothershipNm + "." + a.Config.ApexDomain
+
+	// The mothership runs on its own loopback listener (like the original
+	// deployment), so control-plane traffic is forwarded to it.
+	var msProxy http.Handler
+	if a.Config.MothershipPort > 0 {
+		msProxy = newDaemonForwarder(fmt.Sprintf("http://127.0.0.1:%d", a.Config.MothershipPort), a.Logger)
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		host := hostOnly(r.Host)
+
+		// Control-plane hosts go to the mothership (the original app).
+		if msProxy != nil && (host == mothershipHost || host == a.Config.ApexDomain) {
+			msProxy.ServeHTTP(w, r)
+			return
+		}
+
+		// Instance hosts go to the tenant's native process.
 		if a.isInstanceRequest(r) {
 			a.Proxy.ServeHTTP(w, r)
 			return
 		}
-		apiHandler.ServeHTTP(w, r)
+
+		// The edge admin API lives under its own path prefix.
+		if strings.HasPrefix(r.URL.Path, "/_api/daemon/") || strings.HasPrefix(r.URL.Path, "/_ph/") {
+			apiHandler.ServeHTTP(w, r)
+			return
+		}
+
+		// Anything else is a dashboard request.
+		a.dashboardHandler.ServeHTTP(w, r)
 	})
 }
 
@@ -62,7 +88,7 @@ func (a *App) EdgeHandler() http.Handler {
 	limiter := a.RateLimiter()
 
 	// In single-binary deployments the firewall and daemon are the same process,
-	// so requests are served by the daemon handler directly. When DAEMON_PORT is
+	// so requests are served by the daemon handler directly. When the daemon is
 	// remote (multi-node), requests are forwarded over HTTP instead.
 	var core http.Handler
 	if a.Config.EdgeInternalURL != "" && isRemoteDaemon(a.Config.EdgeInternalURL) {

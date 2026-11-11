@@ -144,8 +144,8 @@ func newMigrateCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			fmt.Printf("imported users=%d instances=%d edges=%d ssh_keys=%d api_tokens=%d versions=%d\n",
-				stats.Users, stats.Instances, stats.Edges, stats.SSHKeys, stats.APITokens, stats.Versions)
+			fmt.Printf("imported users=%d instances=%d edges=%d ssh_keys=%d api_tokens=%d\n",
+				stats.Users, stats.Instances, stats.Edges, stats.SSHKeys, stats.APITokens)
 			return nil
 		},
 	}

@@ -1,12 +1,17 @@
 # PocketHost (Go, Docker-free)
 
-A complete reimplementation of the [PocketHost](https://github.com/pockethost/pockethost)
-multi-tenant PocketBase hosting platform in **pure Go**, with **no Docker, no
-containerd, no Node.js and no CGO**.
+A Docker-free, pure-Go implementation of the [PocketHost](https://github.com/pockethost/pockethost)
+multi-tenant PocketBase hosting platform, with **no Docker, no containerd, no
+Node.js and no CGO**.
 
-Every tenant PocketBase instance now runs as an **isolated native OS process**
-instead of a container: its own working directory, its own loopback port, its own
-PID and lifecycle, its own log files and OS-level resource limits.
+* The **control plane is the original PocketHost mothership application**, with
+  its JavaScript hooks embedded verbatim and executed by the pure-Go
+  [PocketBase SDK](https://github.com/pocketbase/pocketbase) (goja JSVM). All 32
+  routes, realtime, collection rules, billing and the admin UI work unchanged.
+* The **data plane** is rewritten in Go: every tenant PocketBase instance runs
+  as an **isolated native OS process** instead of a container — its own working
+  directory, its own loopback port, its own PID and lifecycle, its own log
+  files and OS-level resource limits.
 
 ```
                     ┌──────────────────────────────────────────────┐
@@ -17,20 +22,22 @@ PID and lifecycle, its own log files and OS-level resource limits.
                     ┌───────────────▼──────────────────────────────┐
                     │ pocketghost daemon  (DAEMON_PORT)            │
                     │  ┌───────────────┐  ┌─────────────────────┐  │
-                    │  │ control-plane │  │ reverse proxy       │  │
-                    │  │ REST + static │  │ (HTTP/WS/SSE)       │  │
+                    │  │ edge admin    │  │ reverse proxy       │  │
+                    │  │ API + static  │  │ (HTTP/WS/SSE)       │  │
                     │  └───────┬───────┘  └──────────┬──────────┘  │
                     │          │                     │             │
-                    │  ┌───────▼────────┐   ┌────────▼──────────┐  │
-                    │  │ SQLite (pure)  │   │ process supervisor│  │
-                    │  └────────────────┘   └────────┬──────────┘  │
-                    └────────────────────────────────┼─────────────┘
-                                                     │ spawn / signals
-                       ┌─────────────┬───────────────┼──────────────┐
-                       ▼             ▼               ▼              ▼
-                   pocketbase    pocketbase      pocketbase     pocketbase
-                   :30001        :30002          :30003         :3000N
-                   (tenant A)    (tenant B)      (tenant C)     (...)
+                    │  ┌───────▼─────────────────────────▼───────┐  │
+                    │  │ mothership  (original app, Go SDK)     │  │
+                    │  │  pb_hooks/*.pb.js  ← embedded verbatim  │  │
+                    │  │  SQLite (pure Go)  ← PocketBase's own  │  │
+                    │  └────────────────────┬───────────────────┘  │
+                    └───────────────────────┼──────────────────────┘
+                                            │ spawn / signals
+                      ┌─────────────┬────────┴────────┬─────────────┐
+                      ▼             ▼                 ▼             ▼
+                  pocketbase    pocketbase        pocketbase    pocketbase
+                  :30001        :30002            :30003        :3000N
+                  (tenant A)    (tenant B)        (tenant C)      (...)
 ```
 
 ## Quick start
@@ -70,17 +77,21 @@ Point tenants at real PocketBase builds:
 
 ```
 cmd/pocketghost          CLI entrypoint (cobra)
+internal/mothership      the ORIGINAL control plane, embedded + run by the
+                          pure-Go PocketBase SDK (goja JSVM, no Node.js)
+internal/mothership/assets
+                          pb_hooks/, pb_migrations/, pb_admin_ext/ — verbatim
 internal/config          environment/settings (1:1 with the legacy constants.ts)
 internal/phome           .env + data directory resolution
 internal/logging         structured logger + per-instance NDJSON logs & tailing
-internal/store           SQLite metadata (modernc.org/sqlite, CGO-free) + legacy import
+internal/store           typed edge view over the PocketBase collections
 internal/procs           native process supervisor, port allocator, restart policy
 internal/pbbin           PocketBase release cache/download/verify/semver
 internal/instance        instance lifecycle, hibernation, status sync
 internal/proxy           dynamic host reverse proxy (HTTP/WebSocket/SSE)
 internal/ratelimit       hourly + concurrent limits, PocketHost headers
 internal/metrics         edge traffic counters
-internal/api             PocketBase-compatible REST + daemon admin API + dashboard
+internal/api             edge admin API + embedded dashboard
 internal/backup          zip snapshots, retention, restore
 internal/scheduler       cron jobs (backups, reconcile, retention)
 internal/tlscert         self-signed dev certs + ACME (autocert)
@@ -99,12 +110,11 @@ internal/dashboard       embedded Svelte build
 
 ## Compatibility
 
-The dashboard and the public REST surface are kept compatible: the Svelte app is
-served from the binary and talks to the same `/api/collections/users/...`,
-`/api/instance`, `/api/versions` and `/_api/daemon/...` routes it always used.
-
-The frontend source stays unmodified in the upstream monorepo; embed its build
-output with:
+The dashboard and the public REST surface are kept compatible. The control
+plane is the *original* mothership application, so `/api/instance`,
+`/api/versions`, `/api/collections/users/...`, `/api/realtime` and every other
+route answer exactly as they always did. The frontend source stays unmodified in
+the upstream monorepo; embed its build output with:
 
 ```bash
 ./scripts/build-dashboard.sh /path/to/pockethost-monorepo   # build-time only

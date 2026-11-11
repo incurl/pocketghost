@@ -134,13 +134,13 @@ func TestEndToEndProxyAndHibernation(t *testing.T) {
 		Verified:             true,
 		Subscription:         store.SubscriptionPremium,
 		SubscriptionQuantity: 2,
-		TokenKey:             "tk",
-		PasswordHash:         "hash",
+		TokenKey:             strings.Repeat("t", 50),
+		PasswordHash:         "0123456789abcdef0123456789abcdef",
 	}
 	if err := a.Repo.CreateUser(ctx, u); err != nil {
 		t.Fatal(err)
 	}
-	inst := &store.Instance{Subdomain: "demo", UID: u.ID, Version: "0.22.0", Power: true}
+	inst := &store.Instance{Subdomain: "demo", UID: u.ID, Status: store.StatusIdle, Version: "0.23.0", Power: true}
 	if err := a.Repo.CreateInstance(ctx, inst); err != nil {
 		t.Fatal(err)
 	}
@@ -242,11 +242,18 @@ func TestCrashRestart(t *testing.T) {
 	}
 	defer a.Close()
 
-	u := &store.User{Email: "crash@example.test", Verified: true, SubscriptionQuantity: 1, TokenKey: "tk", PasswordHash: "hash"}
+	u := &store.User{
+		Email:                "crash@example.test",
+		Verified:             true,
+		Subscription:         store.SubscriptionPremium,
+		SubscriptionQuantity: 1,
+		TokenKey:             strings.Repeat("t", 50),
+		PasswordHash:         "0123456789abcdef0123456789abcdef",
+	}
 	if err := a.Repo.CreateUser(ctx, u); err != nil {
 		t.Fatal(err)
 	}
-	inst := &store.Instance{Subdomain: "crash", UID: u.ID, Version: "0.22.0", Power: true}
+	inst := &store.Instance{Subdomain: "crash", UID: u.ID, Status: store.StatusIdle, Version: "0.23.0", Power: true}
 	if err := a.Repo.CreateInstance(ctx, inst); err != nil {
 		t.Fatal(err)
 	}
